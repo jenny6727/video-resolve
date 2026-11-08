@@ -1,17 +1,17 @@
 """Video link resolver for John's iOS Shortcut.
 
 POST /resolve  {"url": "<video page url>", "audio": false}
-  -> {"title": ..., "url": "<downloadable media url>", "ext": "mp4",
-      "duration": ..., "merged": false}
+  -> 302 redirect to the downloadable media file.
 
-The Shortcut downloads the returned URL and saves it to Photos/Files.
+The Shortcut's Get Contents of URL follows the redirect and downloads
+the file itself, so the Shortcut needs no dictionary/URL-extraction step.
 
 Two paths:
-- Sites with a single combined file (TikTok, Douyin, X, ...): the direct
-  media URL is returned, nothing is stored on the server.
+- Sites with a single combined file (TikTok, Douyin, X, ...): redirect
+  straight to the direct media URL, nothing is stored on the server.
 - Sites that only offer separate video/audio streams (e.g. YouTube):
   the server downloads both parts, merges them with ffmpeg into one mp4
-  in /tmp, and returns a /file/<id> URL for the Shortcut to download.
+  in /tmp, and redirects to /file/<id> for the Shortcut to download.
   Merged files are deleted after 2 hours. Only public, freely
   accessible links are resolved; no login/cookies are used.
 """
@@ -25,7 +25,7 @@ import sys
 import time
 import uuid
 
-from flask import Flask, Response, jsonify, request, send_file
+from flask import Flask, Response, jsonify, redirect, request, send_file
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from build_shortcut import build as build_shortcut  # noqa: E402
@@ -100,7 +100,7 @@ def debug_log():
 
 @app.get("/")
 def health():
-    return jsonify({"ok": True, "service": "video-resolve", "version": "1.3"})
+    return jsonify({"ok": True, "service": "video-resolve", "version": "1.4"})
 
 
 @app.get("/shortcut")
@@ -217,17 +217,12 @@ def resolve():
 
     ext = filename.rsplit(".", 1)[-1] if "." in filename else ("m4a" if audio_only else "mp4")
 
-    # Single combined file: hand the direct URL straight to the Shortcut.
+    # Single combined file: redirect straight to the direct media URL.
+    # (The Shortcut's Get Contents of URL follows the redirect and
+    # downloads the file itself, so no JSON/dictionary step is needed.)
     if audio_only or len(media_urls) == 1:
         _log_resolve(url, 200, "direct")
-        return jsonify({
-            "title": title,
-            "url": media_urls[0],
-            "ext": ext,
-            "duration": duration,
-            "audio_only": audio_only,
-            "merged": False,
-        })
+        return redirect(media_urls[0], code=303)
 
     # Separate video + audio: download both and merge into one mp4.
     job_id = uuid.uuid4().hex[:12]
@@ -254,14 +249,7 @@ def resolve():
                         "detail": detail[-1] if detail else "unknown error"}), 422
 
     _log_resolve(url, 200, "merged")
-    return jsonify({
-        "title": title,
-        "url": f"{_base_url()}/file/{job_id}",
-        "ext": "mp4",
-        "duration": duration,
-        "audio_only": False,
-        "merged": True,
-    })
+    return redirect(f"{_base_url()}/file/{job_id}", code=303)
 
 
 if __name__ == "__main__":

@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """Generate the iOS Shortcut file (.shortcut) for John's video downloader.
 
-The Shortcut flow:
+The Shortcut flow (v1.4, redirect design):
   1. Get Clipboard (the copied video link)
   2. POST {base}/resolve?key={api_key}  JSON {"url": "<clipboard>"}
-  3. Get dictionary value "url" (direct media url)
-  4. Get Contents of that URL (the video file)
-  5. Save to Photo Album
-  6. Show notification
+     -> the server 302-redirects to the media file, and this action
+        follows the redirect and downloads the file itself
+  3. Save to Photo Album
+  4. Show notification
+
+No dictionary/URL-extraction step: an earlier design returned the media
+URL as JSON and extracted it with Get Dictionary Value, but on John's
+phone that step produced an empty URL ("未指定URL") even though the
+server had resolved the link (200 in the server log). The redirect
+design keeps only the parts already proven to work on his phone:
+the clipboard token in the JSON body and the literal resolve URL.
 
 Usage:
   python3 build_shortcut.py --base-url https://xxx.hf.space --api-key KEY --out 下载视频.shortcut
@@ -50,11 +57,6 @@ def text_token(string, attachments):
     }
 
 
-def variable_value(var_uuid, output_name):
-    """A text field holding only a variable: same modern token form."""
-    return text_token("\ufffc", [(0, 1, var_uuid, output_name)])
-
-
 def dict_field_value(pairs):
     items = []
     for k, v in pairs:
@@ -80,15 +82,14 @@ def build(base_url, api_key):
     base_url = base_url.rstrip("/")
     clipboard_uuid = new_uuid()
     resolve_uuid = new_uuid()
-    url_value_uuid = new_uuid()
-    media_uuid = new_uuid()
 
     # 1. Get Clipboard
     a1 = action("is.workflow.actions.getclipboard", {})
 
     # 2. POST {base}/resolve?key=... with JSON body {"url": "<clipboard>"}
     # WFJSONValues is a dictionary-field value: one item, key "url",
-    # value = the clipboard token.
+    # value = the clipboard token. The server 302-redirects to the media
+    # file and this action follows the redirect, downloading the video.
     body = dict_field_value([
         ("url", text_token("\ufffc", [
             (0, 1, clipboard_uuid, "Clipboard"),
@@ -105,39 +106,24 @@ def build(base_url, api_key):
         ]),
     })
 
-    # 3. Get dictionary value "url" (internal identifier is getvalueforkey,
-    # not getdictionaryvalue)
-    a3 = action("is.workflow.actions.getvalueforkey", {
-        "WFDictionaryKey": "url",
-        "WFGetDictionaryValueType": "Value",
-    })
+    # 3. Save to Photo Album (identifier is savetocameraroll, not savetophotoalbum)
+    a3 = action("is.workflow.actions.savetocameraroll", {})
 
-    # 4. Get Contents of the media URL (output of action 3)
-    a4 = action("is.workflow.actions.downloadurl", {
-        "WFURL": variable_value(url_value_uuid, "Dictionary Value"),
-        "WFHTTPMethod": "GET",
-    })
-
-    # 5. Save to Photo Album (identifier is savetocameraroll, not savetophotoalbum)
-    a5 = action("is.workflow.actions.savetocameraroll", {})
-
-    # 6. Notification (identifier is notification, not shownotification)
-    a6 = action("is.workflow.actions.notification", {
+    # 4. Notification (identifier is notification, not shownotification)
+    a4 = action("is.workflow.actions.notification", {
         "WFNotificationActionTitle": "下载视频",
         "WFNotificationActionBody": "视频已保存到相册",
         "WFNotificationActionSound": True,
     })
 
-    actions = [a1, a2, a3, a4, a5, a6]
+    actions = [a1, a2, a3, a4]
     # Attach output UUIDs so later actions can reference them, and give
     # every action its own UUID (Shortcuts import rejects actions without one).
     for act, out_uuid in [
         (a1, clipboard_uuid),
         (a2, resolve_uuid),
-        (a3, url_value_uuid),
-        (a4, media_uuid),
-        (a5, new_uuid()),
-        (a6, new_uuid()),
+        (a3, new_uuid()),
+        (a4, new_uuid()),
     ]:
         act["WFWorkflowActionParameters"]["UUID"] = out_uuid
 
