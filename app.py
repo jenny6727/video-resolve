@@ -1,18 +1,29 @@
 """Video link resolver for John's iOS Shortcut.
 
 POST /resolve  {"url": "<video page url>", "audio": false}
-  -> {"title": ..., "url": "<direct media url>", "ext": "mp4", "duration": ..., "site": ...}
+  -> {"title": ..., "url": "<downloadable media url>", "ext": "mp4",
+      "duration": ..., "merged": false}
 
-The Shortcut then downloads the direct URL itself and saves it to Photos/Files.
-This keeps the server stateless: no video files are stored here.
-Only public, freely accessible links are resolved; no login/cookies are used.
+The Shortcut downloads the returned URL and saves it to Photos/Files.
+
+Two paths:
+- Sites with a single combined file (TikTok, Douyin, X, ...): the direct
+  media URL is returned, nothing is stored on the server.
+- Sites that only offer separate video/audio streams (e.g. YouTube):
+  the server downloads both parts, merges them with ffmpeg into one mp4
+  in /tmp, and returns a /file/<id> URL for the Shortcut to download.
+  Merged files are deleted after 2 hours. Only public, freely
+  accessible links are resolved; no login/cookies are used.
 """
-import json
+import glob
 import os
+import re
 import subprocess
 import sys
+import time
+import uuid
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 
 app = Flask(__name__)
 
@@ -20,6 +31,8 @@ API_KEY = os.environ.get("API_KEY", "")
 # Run yt-dlp as a module so it works regardless of PATH (venv, Docker, etc.)
 YT_DLP_CMD = [sys.executable, "-m", "yt_dlp"]
 TIMEOUT = int(os.environ.get("RESOLVE_TIMEOUT", "90"))
+MERGE_TIMEOUT = int(os.environ.get("MERGE_TIMEOUT", "280"))
+TMP_DIR = os.environ.get("TMP_DIR", "/tmp")
 
 
 def _check_key():
@@ -32,9 +45,35 @@ def _check_key():
     return jsonify({"error": "unauthorized"}), 401
 
 
+def _base_url():
+    proto = request.headers.get("X-Forwarded-Proto", request.scheme)
+    return f"{proto}://{request.host}"
+
+
+def _cleanup_old_files():
+    now = time.time()
+    for path in glob.glob(os.path.join(TMP_DIR, "vr-*.mp4")):
+        try:
+            if now - os.path.getmtime(path) > 2 * 3600:
+                os.remove(path)
+        except OSError:
+            pass
+
+
 @app.get("/")
 def health():
-    return jsonify({"ok": True, "service": "video-resolve", "version": "1.0"})
+    return jsonify({"ok": True, "service": "video-resolve", "version": "1.1"})
+
+
+@app.get("/file/<job_id>")
+def serve_file(job_id):
+    if not re.fullmatch(r"[0-9a-f]{12}", job_id or ""):
+        return jsonify({"error": "not found"}), 404
+    path = os.path.join(TMP_DIR, f"vr-{job_id}.mp4")
+    if not os.path.isfile(path):
+        return jsonify({"error": "file expired or not found"}), 404
+    return send_file(path, mimetype="video/mp4", as_attachment=False,
+                     download_name=f"video-{job_id}.mp4")
 
 
 @app.get("/resolve")
@@ -50,7 +89,12 @@ def resolve():
     if not url or not url.startswith(("http://", "https://")):
         return jsonify({"error": "need a http(s) video url"}), 400
 
-    fmt = "ba/bestaudio" if audio_only else "mp4"
+    _cleanup_old_files()
+
+    # One combined file when the site offers it; otherwise separate
+    # video (<=720p) + audio streams that we merge server-side.
+    fmt = "ba/bestaudio" if audio_only else \
+        "bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"
     cmd = YT_DLP_CMD + [
         "--no-playlist",
         "--no-warnings",
@@ -74,7 +118,6 @@ def resolve():
 
     # yt-dlp prints title, direct url(s), filename, duration -- order varies,
     # so classify each line instead of assuming positions.
-    import re
     media_urls, title, filename, duration = [], None, "", None
     for ln in lines:
         if ln.startswith(("http://", "https://")):
@@ -89,13 +132,47 @@ def resolve():
         return jsonify({"error": "no direct media url found"}), 422
 
     ext = filename.rsplit(".", 1)[-1] if "." in filename else ("m4a" if audio_only else "mp4")
+
+    # Single combined file: hand the direct URL straight to the Shortcut.
+    if audio_only or len(media_urls) == 1:
+        return jsonify({
+            "title": title,
+            "url": media_urls[0],
+            "ext": ext,
+            "duration": duration,
+            "audio_only": audio_only,
+            "merged": False,
+        })
+
+    # Separate video + audio: download both and merge into one mp4.
+    job_id = uuid.uuid4().hex[:12]
+    out_tmpl = os.path.join(TMP_DIR, f"vr-{job_id}.%(ext)s")
+    merge_cmd = YT_DLP_CMD + [
+        "--no-playlist",
+        "--no-warnings",
+        "-f", fmt,
+        "--merge-output-format", "mp4",
+        "-o", out_tmpl,
+        url,
+    ]
+    try:
+        mproc = subprocess.run(merge_cmd, capture_output=True, text=True,
+                               timeout=MERGE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "download took too long, try a shorter video"}), 504
+    merged_path = os.path.join(TMP_DIR, f"vr-{job_id}.mp4")
+    if mproc.returncode != 0 or not os.path.isfile(merged_path):
+        detail = (mproc.stderr or "").strip().splitlines()
+        return jsonify({"error": "could not download/merge this video",
+                        "detail": detail[-1] if detail else "unknown error"}), 422
+
     return jsonify({
         "title": title,
-        "url": media_urls[0],
-        "all_urls": media_urls,
-        "ext": ext,
+        "url": f"{_base_url()}/file/{job_id}",
+        "ext": "mp4",
         "duration": duration,
-        "audio_only": audio_only,
+        "audio_only": False,
+        "merged": True,
     })
 
 
