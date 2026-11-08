@@ -128,12 +128,14 @@ def build(base_url, api_key):
         "WFHTTPMethod": "GET",
     })
 
-    # 5. Save to Photo Album
-    a5 = action("is.workflow.actions.savetophotoalbum", {})
+    # 5. Save to Photo Album (identifier is savetocameraroll, not savetophotoalbum)
+    a5 = action("is.workflow.actions.savetocameraroll", {})
 
-    # 6. Notification
-    a6 = action("is.workflow.actions.shownotification", {
+    # 6. Notification (identifier is notification, not shownotification)
+    a6 = action("is.workflow.actions.notification", {
+        "WFNotificationActionTitle": "下载视频",
         "WFNotificationActionBody": "视频已保存到相册",
+        "WFNotificationActionSound": True,
     })
 
     actions = [a1, a2, a3, a4, a5, a6]
