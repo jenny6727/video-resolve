@@ -116,8 +116,9 @@ def build(base_url, api_key):
         ]),
     })
 
-    # 3. Get dictionary value "url"
-    a3 = action("is.workflow.actions.getdictionaryvalue", {
+    # 3. Get dictionary value "url" (internal identifier is getvalueforkey,
+    # not getdictionaryvalue)
+    a3 = action("is.workflow.actions.getvalueforkey", {
         "WFDictionaryKey": "url",
         "WFGetDictionaryValueType": "Value",
     })
