@@ -27,21 +27,22 @@ def new_uuid():
 
 
 def text_token(string, attachments):
-    """A WF text-token string: {"Value": {"string": ..., "attachmentsByRange": {...}},
-    "WFSerializationType": "WFTextTokenString"}.
-    attachments: list of (start_index, length, variable_uuid, output_name)"""
+    """A WF text-token string in the modern (iOS 13+) form:
+    {"Value": {"string": ..., "attachmentsByRange": {"{start, length}":
+      {"OutputName": ..., "OutputUUID": ..., "Type": "ActionOutput"}}},
+     "WFSerializationType": "WFTextTokenString"}.
+    A literal has an empty attachmentsByRange; a variable token has
+    string "\ufffc" (U+FFFC) with one attachment covering it.
+    attachments: list of (start_index, length, variable_uuid, output_name).
+    NOTE: the older {"Type": "Variable", "Variable": {...}} wrapper renders
+    in the editor but evaluates to an empty string at runtime, which is
+    what made Shortcuts report "未指定URL"."""
     ranges = {}
     for start, length, var_uuid, output_name in attachments:
         ranges["{%d, %d}" % (start, length)] = {
-            "Type": "Variable",
-            "Variable": {
-                "Value": {
-                    "OutputUUID": var_uuid,
-                    "Type": "ActionOutput",
-                    "OutputName": output_name,
-                },
-                "Type": "Variable",
-            },
+            "OutputName": output_name,
+            "OutputUUID": var_uuid,
+            "Type": "ActionOutput",
         }
     return {
         "Value": {"string": string, "attachmentsByRange": ranges},
@@ -50,20 +51,8 @@ def text_token(string, attachments):
 
 
 def variable_value(var_uuid, output_name):
-    return {
-        "Value": {
-            "Type": "Variable",
-            "Variable": {
-                "Value": {
-                    "OutputUUID": var_uuid,
-                    "Type": "ActionOutput",
-                    "OutputName": output_name,
-                },
-                "Type": "Variable",
-            },
-        },
-        "WFSerializationType": "WFTextTokenAttachment",
-    }
+    """A text field holding only a variable: same modern token form."""
+    return text_token("\ufffc", [(0, 1, var_uuid, output_name)])
 
 
 def dict_field_value(pairs):
