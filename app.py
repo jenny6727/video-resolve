@@ -40,7 +40,12 @@ app = Flask(__name__)
 
 API_KEY = os.environ.get("API_KEY", "")
 # Run yt-dlp as a module so it works regardless of PATH (venv, Docker, etc.)
-YT_DLP_CMD = [sys.executable, "-m", "yt_dlp"]
+# The android player client bypasses YouTube's "Sign in to confirm you're
+# not a bot" challenge that datacenter IPs hit (verified 2026-11-09 on the
+# exact video that failed for John); the arg is YouTube-namespaced, so
+# other sites ignore it.
+YT_DLP_CMD = [sys.executable, "-m", "yt_dlp",
+              "--extractor-args", "youtube:player_client=android"]
 TIMEOUT = int(os.environ.get("RESOLVE_TIMEOUT", "90"))
 MERGE_TIMEOUT = int(os.environ.get("MERGE_TIMEOUT", "280"))
 TMP_DIR = os.environ.get("TMP_DIR", "/tmp")
@@ -132,7 +137,7 @@ def debug_log():
 
 @app.get("/")
 def health():
-    return jsonify({"ok": True, "service": "video-resolve", "version": "1.5"})
+    return jsonify({"ok": True, "service": "video-resolve", "version": "1.6"})
 
 
 @app.get("/shortcut")
