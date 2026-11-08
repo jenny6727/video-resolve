@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """Generate the iOS Shortcut file (.shortcut) for John's video downloader.
 
-The Shortcut flow (v1.4, redirect design):
+The Shortcut flow (v1.5, proxy design):
   1. Get Clipboard (the copied video link)
   2. POST {base}/resolve?key={api_key}  JSON {"url": "<clipboard>"}
-     -> the server 302-redirects to the media file, and this action
-        follows the redirect and downloads the file itself
-  3. Save to Photo Album
+     -> the server streams the video file bytes back (no redirect)
+  3. Save to Photo Album, with an EXPLICIT WFInput token pointing at
+     step 2's output ("Contents of URL"). A real exported shortcut
+     (shortcut-lib samples/decoded/dictionary.xml) shows Save to Camera
+     Roll carrying exactly this WFInput parameter; without it the save
+     step runs but silently saves nothing, which is what John saw:
+     the shortcut ran through and the notification showed, but no
+     video appeared in Photos. The WFInput token uses the form Apple
+     itself writes for content-item inputs: {"Value": {OutputName,
+     OutputUUID, Type: "ActionOutput"}, "WFSerializationType":
+     "WFTextTokenAttachment"}.
   4. Show notification
 
 No dictionary/URL-extraction step: an earlier design returned the media
 URL as JSON and extracted it with Get Dictionary Value, but on John's
 phone that step produced an empty URL ("未指定URL") even though the
-server had resolved the link (200 in the server log). The redirect
-design keeps only the parts already proven to work on his phone:
-the clipboard token in the JSON body and the literal resolve URL.
+server had resolved the link (200 in the server log).
 
 Usage:
   python3 build_shortcut.py --base-url https://xxx.hf.space --api-key KEY --out 下载视频.shortcut
@@ -106,8 +112,19 @@ def build(base_url, api_key):
         ]),
     })
 
-    # 3. Save to Photo Album (identifier is savetocameraroll, not savetophotoalbum)
-    a3 = action("is.workflow.actions.savetocameraroll", {})
+    # 3. Save to Photo Album (identifier is savetocameraroll, not savetophotoalbum).
+    # Explicit WFInput: tell this step exactly which file to save (step 2's
+    # output). Without it the step runs but silently saves nothing.
+    a3 = action("is.workflow.actions.savetocameraroll", {
+        "WFInput": {
+            "Value": {
+                "OutputName": "Contents of URL",
+                "OutputUUID": resolve_uuid,
+                "Type": "ActionOutput",
+            },
+            "WFSerializationType": "WFTextTokenAttachment",
+        },
+    })
 
     # 4. Notification (identifier is notification, not shownotification)
     a4 = action("is.workflow.actions.notification", {
