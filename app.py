@@ -1,31 +1,37 @@
 """Video link resolver for John's iOS Shortcut.
 
 POST /resolve  {"url": "<video page url>", "audio": false}
-  -> 302 redirect to the downloadable media file.
+  -> 200, the video file bytes themselves (video/mp4).
 
-The Shortcut's Get Contents of URL follows the redirect and downloads
-the file itself, so the Shortcut needs no dictionary/URL-extraction step.
+The Shortcut's Get Contents of URL receives the file directly, so it
+needs no redirect-following and no dictionary/URL-extraction step.
+(An earlier design 302-redirected to the media URL; on John's phone the
+save step then silently saved nothing, so the server now proxies the
+file bytes instead.)
 
 Two paths:
-- Sites with a single combined file (TikTok, Douyin, X, ...): redirect
-  straight to the direct media URL, nothing is stored on the server.
+- Sites with a single combined file (TikTok, Douyin, X, ...): the server
+  downloads the direct media file to /tmp and streams it back.
 - Sites that only offer separate video/audio streams (e.g. YouTube):
   the server downloads both parts, merges them with ffmpeg into one mp4
-  in /tmp, and redirects to /file/<id> for the Shortcut to download.
-  Merged files are deleted after 2 hours. Only public, freely
+  in /tmp, and streams that back.
+  Served files are deleted after 2 hours. Only public, freely
   accessible links are resolved; no login/cookies are used.
 """
 import glob
 import json
+import mimetypes
 import os
 import plistlib
 import re
+import shutil
 import subprocess
 import sys
 import time
+import urllib.request
 import uuid
 
-from flask import Flask, Response, jsonify, redirect, request, send_file
+from flask import Flask, Response, jsonify, request, send_file
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from build_shortcut import build as build_shortcut  # noqa: E402
@@ -62,12 +68,38 @@ def _base_url():
 
 def _cleanup_old_files():
     now = time.time()
-    for path in glob.glob(os.path.join(TMP_DIR, "vr-*.mp4")):
+    for path in glob.glob(os.path.join(TMP_DIR, "vr-*.*")):
         try:
             if now - os.path.getmtime(path) > 2 * 3600:
                 os.remove(path)
         except OSError:
             pass
+
+
+def _download_media(media_url, path, timeout=120):
+    """Fetch a direct media URL to a local file. Returns True on success."""
+    req = urllib.request.Request(media_url, headers={
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/120.0 Safari/537.36"),
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp, \
+                open(path, "wb") as f:
+            shutil.copyfileobj(resp, f, length=1024 * 256)
+    except Exception:  # noqa: BLE001 - any fetch failure is a resolve failure
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return False
+    return os.path.isfile(path) and os.path.getsize(path) > 0
+
+
+def _serve_media_file(path, ext):
+    mimetype = mimetypes.guess_type(f"file.{ext}")[0] or "video/mp4"
+    return send_file(path, mimetype=mimetype, as_attachment=False,
+                     download_name=f"video.{ext}")
 
 
 # In-memory log of recent /resolve attempts (per worker, last 20).
@@ -100,7 +132,7 @@ def debug_log():
 
 @app.get("/")
 def health():
-    return jsonify({"ok": True, "service": "video-resolve", "version": "1.4"})
+    return jsonify({"ok": True, "service": "video-resolve", "version": "1.5"})
 
 
 @app.get("/shortcut")
@@ -217,12 +249,15 @@ def resolve():
 
     ext = filename.rsplit(".", 1)[-1] if "." in filename else ("m4a" if audio_only else "mp4")
 
-    # Single combined file: redirect straight to the direct media URL.
-    # (The Shortcut's Get Contents of URL follows the redirect and
-    # downloads the file itself, so no JSON/dictionary step is needed.)
+    # Single combined file: download it and stream the bytes back, so the
+    # Shortcut receives the video itself (no redirect to follow).
     if audio_only or len(media_urls) == 1:
         _log_resolve(url, 200, "direct")
-        return redirect(media_urls[0], code=303)
+        job_id = uuid.uuid4().hex[:12]
+        local_path = os.path.join(TMP_DIR, f"vr-{job_id}.{ext}")
+        if not _download_media(media_urls[0], local_path):
+            return jsonify({"error": "could not download this video"}), 422
+        return _serve_media_file(local_path, ext)
 
     # Separate video + audio: download both and merge into one mp4.
     job_id = uuid.uuid4().hex[:12]
@@ -249,7 +284,7 @@ def resolve():
                         "detail": detail[-1] if detail else "unknown error"}), 422
 
     _log_resolve(url, 200, "merged")
-    return redirect(f"{_base_url()}/file/{job_id}", code=303)
+    return _serve_media_file(merged_path, "mp4")
 
 
 if __name__ == "__main__":
