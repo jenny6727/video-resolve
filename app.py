@@ -70,9 +70,37 @@ def _cleanup_old_files():
             pass
 
 
+# In-memory log of recent /resolve attempts (per worker, last 20).
+# Only the link's domain is recorded, never the full URL.
+RESOLVE_LOG = []
+
+
+def _log_resolve(url, status, error=""):
+    domain = ""
+    m = re.match(r"https?://([^/]+)", url or "")
+    if m:
+        domain = m.group(1)
+    RESOLVE_LOG.append({
+        "t": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+        "domain": domain or "(empty)",
+        "status": status,
+        "error": error,
+    })
+    del RESOLVE_LOG[:-20]
+
+
+@app.get("/debug")
+def debug_log():
+    """Recent /resolve attempts (domain + status only). Key-protected."""
+    err = _check_key()
+    if err is not None:
+        return err
+    return jsonify({"log": RESOLVE_LOG})
+
+
 @app.get("/")
 def health():
-    return jsonify({"ok": True, "service": "video-resolve", "version": "1.2"})
+    return jsonify({"ok": True, "service": "video-resolve", "version": "1.3"})
 
 
 @app.get("/shortcut")
@@ -139,6 +167,7 @@ def resolve():
     url = (data.get("url") or request.args.get("url") or "").strip()
     audio_only = bool(data.get("audio") or request.args.get("audio"))
     if not url or not url.startswith(("http://", "https://")):
+        _log_resolve(url, 400, "need a http(s) video url")
         return jsonify({"error": "need a http(s) video url"}), 400
 
     _cleanup_old_files()
@@ -160,11 +189,13 @@ def resolve():
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT)
     except subprocess.TimeoutExpired:
+        _log_resolve(url, 504, "resolve timed out")
         return jsonify({"error": "resolve timed out, try again"}), 504
 
     lines = [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
     if proc.returncode != 0 or not lines:
         detail = (proc.stderr or "").strip().splitlines()
+        _log_resolve(url, 422, detail[-1] if detail else "could not resolve")
         return jsonify({"error": "could not resolve this link",
                         "detail": detail[-1] if detail else "unknown error"}), 422
 
@@ -181,12 +212,14 @@ def resolve():
         elif title is None:
             title = ln
     if not media_urls:
+        _log_resolve(url, 422, "no direct media url found")
         return jsonify({"error": "no direct media url found"}), 422
 
     ext = filename.rsplit(".", 1)[-1] if "." in filename else ("m4a" if audio_only else "mp4")
 
     # Single combined file: hand the direct URL straight to the Shortcut.
     if audio_only or len(media_urls) == 1:
+        _log_resolve(url, 200, "direct")
         return jsonify({
             "title": title,
             "url": media_urls[0],
@@ -211,13 +244,16 @@ def resolve():
         mproc = subprocess.run(merge_cmd, capture_output=True, text=True,
                                timeout=MERGE_TIMEOUT)
     except subprocess.TimeoutExpired:
+        _log_resolve(url, 504, "download took too long")
         return jsonify({"error": "download took too long, try a shorter video"}), 504
     merged_path = os.path.join(TMP_DIR, f"vr-{job_id}.mp4")
     if mproc.returncode != 0 or not os.path.isfile(merged_path):
         detail = (mproc.stderr or "").strip().splitlines()
+        _log_resolve(url, 422, detail[-1] if detail else "could not download/merge")
         return jsonify({"error": "could not download/merge this video",
                         "detail": detail[-1] if detail else "unknown error"}), 422
 
+    _log_resolve(url, 200, "merged")
     return jsonify({
         "title": title,
         "url": f"{_base_url()}/file/{job_id}",
