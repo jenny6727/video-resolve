@@ -16,14 +16,19 @@ Two paths:
   accessible links are resolved; no login/cookies are used.
 """
 import glob
+import json
 import os
+import plistlib
 import re
 import subprocess
 import sys
 import time
 import uuid
 
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, Response, jsonify, request, send_file
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from build_shortcut import build as build_shortcut  # noqa: E402
 
 app = Flask(__name__)
 
@@ -33,6 +38,11 @@ YT_DLP_CMD = [sys.executable, "-m", "yt_dlp"]
 TIMEOUT = int(os.environ.get("RESOLVE_TIMEOUT", "90"))
 MERGE_TIMEOUT = int(os.environ.get("MERGE_TIMEOUT", "280"))
 TMP_DIR = os.environ.get("TMP_DIR", "/tmp")
+
+# The signed .shortcut file, built once per worker and cached.
+# The key lives only in the server env var; the repo holds no secret.
+_signed_shortcut = None
+HUBSIGN_URL = "https://hubsign.routinehub.services/sign"
 
 
 def _check_key():
@@ -62,7 +72,49 @@ def _cleanup_old_files():
 
 @app.get("/")
 def health():
-    return jsonify({"ok": True, "service": "video-resolve", "version": "1.1"})
+    return jsonify({"ok": True, "service": "video-resolve", "version": "1.2"})
+
+
+@app.get("/shortcut")
+def serve_shortcut():
+    """Serve the signed iOS Shortcut file for one-tap install.
+
+    The file is built here from the API_KEY env var and signed on the fly
+    via RoutineHub's free HubSign service, then cached per worker.
+    Install from the phone with:
+      shortcuts://import-shortcut?url=<this url, url-encoded>
+    """
+    global _signed_shortcut
+    if _signed_shortcut is not None:
+        data = _signed_shortcut
+    else:
+        if not API_KEY:
+            return jsonify({"error": "service not configured"}), 500
+        workflow = build_shortcut(_base_url(), API_KEY)
+        xml = plistlib.dumps(workflow, fmt=plistlib.FMT_XML).decode("utf-8")
+        payload = json.dumps({"shortcutName": "下载视频", "shortcut": xml}).encode("utf-8")
+        # Call HubSign with curl, not urllib: the service fingerprints
+        # Python's TLS handshake and closes the connection on it.
+        try:
+            proc = subprocess.run(
+                ["curl", "-s", "-m", "60", "-X", "POST", HUBSIGN_URL,
+                 "-H", "Origin: https://routinehub.co",
+                 "-H", "Referer: https://routinehub.co/",
+                 "-H", "Content-Type: application/json",
+                 "--data-binary", "@-"],
+                input=payload, capture_output=True, timeout=70)
+            data = proc.stdout
+        except Exception as exc:  # noqa: BLE001 - report as 502
+            return jsonify({"error": "signing service unavailable",
+                            "detail": str(exc)}), 502
+        if not data.startswith(b"AEA1"):
+            return jsonify({"error": "signing failed"}), 502
+        _signed_shortcut = data
+    return Response(
+        data,
+        mimetype="application/octet-stream",
+        headers={"Content-Disposition": 'attachment; filename="download-video.shortcut"'},
+    )
 
 
 @app.get("/file/<job_id>")
