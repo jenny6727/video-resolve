@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: video-resolve
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: API_KEY
+        sync: false
